@@ -1,4 +1,4 @@
-"""Measure the throughput of ten sequential HTTP(S) downloads."""
+"""Measure the throughput of a bounded series of HTTP(S) downloads."""
 
 import argparse
 import http.client
@@ -28,6 +28,7 @@ MAX_REDIRECTS = 10
 Reason = Literal[
     "http_error", "network_error", "io_timeout", "download_timeout",
     "incomplete_response", "protocol_error", "cancelled", "worker_error",
+    "time_limit", "byte_limit",
 ]
 
 
@@ -71,15 +72,27 @@ class PartialDownload:
 
 
 class DownloadError(Exception):
-    """An incomplete series, with its successful prefix and failed attempt."""
+    """An incomplete series, with a successful prefix and optional attempt."""
 
-    def __init__(self, partial: PartialDownload, downloads: tuple[Download, ...] = ()):
+    def __init__(
+        self, partial: PartialDownload | None, downloads: tuple[Download, ...] = (),
+        *, requested_count: int = REQUEST_COUNT, reason: Reason | None = None,
+        detail: str | None = None,
+    ):
         self.partial = partial
         self.downloads = downloads
-        super().__init__(
-            f"Request {partial.number}/{REQUEST_COUNT} failed: "
-            f"{partial.reason}: {partial.detail}"
-        )
+        self.requested_count = requested_count
+        if partial is not None:
+            self.reason = partial.reason
+            self.detail = partial.detail
+            label = f"Request {partial.number}/{requested_count} failed"
+        else:
+            if reason is None or detail is None:
+                raise ValueError("a series stop requires a reason and detail")
+            self.reason = reason
+            self.detail = detail
+            label = "Series stopped"
+        super().__init__(f"{label}: {self.reason}: {self.detail}")
 
 
 class _ProtocolError(http.client.HTTPException):
@@ -223,7 +236,9 @@ class _Failure:
     exact_bytes: bool = True
 
 
-def _download_worker(sender: Connection, url: str, timeout: float) -> None:
+def _download_worker(
+    sender: Connection, url: str, timeout: float, max_bytes: int | None = None,
+) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     count = 0
     started = perf_counter()
@@ -248,7 +263,19 @@ def _download_worker(sender: Connection, url: str, timeout: float) -> None:
                     continue
                 if not 200 <= response.status < 300:
                     raise HTTPError(url, response.status, response.reason, response.headers, None)
-                while data := response.read1(CHUNK_SIZE):
+                while True:
+                    remaining = None if max_bytes is None else max_bytes - count
+                    if remaining == 0:
+                        # A fixed-length body proves completion at the boundary.
+                        # Chunked/EOF would require another read, violating the cap.
+                        if not response.chunked and response.length == 0:
+                            break
+                        sender.send(_Failure("byte_limit", "series byte budget exhausted", count,
+                                             perf_counter() - started))
+                        return
+                    data = response.read1(CHUNK_SIZE if remaining is None else min(CHUNK_SIZE, remaining))
+                    if not data:
+                        break
                     count += len(data)
                     sender.send(_Progress(count))
                 result = Download(perf_counter() - started, count)
@@ -338,10 +365,17 @@ def _cleanup(worker, sender, receiver, reader, completed: bool) -> bool:
 
 def download_once(
     url: str, timeout: float, download_timeout: float = DEFAULT_DOWNLOAD_TIMEOUT,
+    *, series_deadline: float | None = None, max_bytes: int | None = None,
 ) -> Download:
     """Supervise one attempt, including startup, DNS and every redirect."""
     started = perf_counter()
     deadline = started + download_timeout
+    deadline_reason: Reason = "download_timeout"
+    if series_deadline is not None and series_deadline <= deadline:
+        deadline = series_deadline
+        deadline_reason = "time_limit"
+    if series_deadline is not None and started >= series_deadline:
+        raise DownloadError(None, reason="time_limit", detail="series deadline exceeded")
     receiver = sender = worker = reader = None
     messages = queue.Queue(maxsize=1)
     count = 0
@@ -350,7 +384,7 @@ def download_once(
     try:
         context = multiprocessing.get_context("spawn")
         receiver, sender = context.Pipe(duplex=False)
-        worker = context.Process(target=_download_worker, args=(sender, url, timeout))
+        worker = context.Process(target=_download_worker, args=(sender, url, timeout, max_bytes))
         reader = threading.Thread(target=_receive, args=(receiver, messages), daemon=True)
         worker.start()
         sender.close()
@@ -358,7 +392,8 @@ def download_once(
         while True:
             remaining = deadline - perf_counter()
             if remaining <= 0:
-                failure = _Failure("download_timeout", "download deadline exceeded", count,
+                failure = _Failure(deadline_reason, "download deadline exceeded" if deadline_reason == "download_timeout"
+                                   else "series deadline exceeded", count,
                                    perf_counter() - started, False)
                 break
             try:
@@ -410,26 +445,38 @@ def download_once(
 def measure(
     url: str, timeout: float = DEFAULT_TIMEOUT,
     download_timeout: float = DEFAULT_DOWNLOAD_TIMEOUT,
+    *, count: int = REQUEST_COUNT, max_time: float | None = None, max_bytes: int | None = None,
 ) -> Summary:
-    """Perform exactly ten downloads, one after another."""
+    """Perform sequential downloads until count is complete or a budget stops us."""
+    deadline = None if max_time is None else perf_counter() + max_time
     downloads = []
+    total_bytes = 0
     try:
-        for index in range(1, REQUEST_COUNT + 1):
+        for index in range(1, count + 1):
+            if deadline is not None and perf_counter() >= deadline:
+                raise DownloadError(None, tuple(downloads), requested_count=count,
+                                    reason="time_limit", detail="series deadline exceeded")
+            remaining = None if max_bytes is None else max_bytes - total_bytes
+            if remaining is not None and remaining <= 0:
+                raise DownloadError(None, tuple(downloads), requested_count=count,
+                                    reason="byte_limit", detail="series byte budget exhausted")
             try:
-                item = download_once(url, timeout, download_timeout)
+                item = download_once(url, timeout, download_timeout,
+                                     series_deadline=deadline, max_bytes=remaining)
             except DownloadError as exc:
-                raise DownloadError(replace(exc.partial, number=index), tuple(downloads)) from exc
+                partial = None if exc.partial is None else replace(exc.partial, number=index)
+                raise DownloadError(partial, tuple(downloads), requested_count=count,
+                                    reason=exc.reason, detail=exc.detail) from exc
             downloads.append(item)
+            total_bytes += item.bytes_downloaded
             print(
-                f"Request {index:02d}/{REQUEST_COUNT}: "
+                f"Request {index:02d}/{count}: "
                 f"{item.elapsed_seconds:.3f} s, {item.bytes_downloaded:,} bytes",
                 flush=True,
             )
     except KeyboardInterrupt:
-        raise DownloadError(PartialDownload(
-            min(len(downloads) + 1, REQUEST_COUNT), 0, 0,
-            "cancelled", False, "interrupted by user",
-        ), tuple(downloads)) from None
+        raise DownloadError(None, tuple(downloads), requested_count=count,
+                            reason="cancelled", detail="interrupted by user") from None
     return Summary(tuple(downloads))
 
 
@@ -440,6 +487,16 @@ def positive_seconds(value: str) -> float:
         raise argparse.ArgumentTypeError("timeout must be a number") from exc
     if not math.isfinite(result) or result <= 0:
         raise argparse.ArgumentTypeError("timeout must be a positive finite number")
+    return result
+
+
+def positive_integer(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if result <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
     return result
 
 
@@ -455,7 +512,7 @@ def socket_seconds(value: str) -> float:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Measure download speed using 10 sequential HTTP(S) requests."
+        description="Measure download speed using sequential HTTP(S) requests."
     )
     parser.add_argument("url", help="URL of an HTTP(S) resource")
     parser.add_argument(
@@ -466,6 +523,13 @@ def main(argv: list[str] | None = None) -> int:
         "--download-timeout", type=positive_seconds, default=DEFAULT_DOWNLOAD_TIMEOUT,
         metavar="SECONDS", help="total deadline for each download, including DNS (default: 120)",
     )
+    parser.add_argument("--count", type=positive_integer, default=REQUEST_COUNT, metavar="N",
+                        help="number of sequential downloads (default: 10)")
+    parser.add_argument("--max-time", type=positive_seconds, metavar="SECONDS",
+                        help="total series time budget, including startup and cleanup (default: unlimited)")
+    parser.add_argument("--max-bytes", type=positive_integer, metavar="BYTES",
+                        help="series HTTP body byte cap (default: unlimited); chunked/EOF responses "
+                             "at the exact cap remain incomplete without a further read")
     args = parser.parse_args(argv)
     try:
         _validate_url(args.url)
@@ -473,19 +537,21 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"invalid URL: {exc}")
     print(f"URL: {args.url}\n", flush=True)
     try:
-        summary = measure(args.url, timeout=args.timeout, download_timeout=args.download_timeout)
+        summary = measure(args.url, timeout=args.timeout, download_timeout=args.download_timeout,
+                          count=args.count, max_time=args.max_time, max_bytes=args.max_bytes)
     except DownloadError as exc:
         partial = exc.partial
         print(f"Error: {exc}", file=sys.stderr)
         print(
-            f"Completed: {len(exc.downloads)}/{REQUEST_COUNT} requests, "
+            f"Completed: {len(exc.downloads)}/{exc.requested_count} requests, "
             f"{sum(item.bytes_downloaded for item in exc.downloads):,} bytes, "
             f"{sum(item.elapsed_seconds for item in exc.downloads):.3f} s", file=sys.stderr,
         )
-        accuracy = "" if partial.exact_bytes else "at least "
-        print(f"Partial request {partial.number}: {accuracy}{partial.bytes_downloaded:,} bytes, "
-              f"{partial.elapsed_seconds:.3f} s", file=sys.stderr)
-        return 130 if partial.reason == "cancelled" else 1
+        if partial is not None:
+            accuracy = "" if partial.exact_bytes else "at least "
+            print(f"Partial request {partial.number}: {accuracy}{partial.bytes_downloaded:,} bytes, "
+                  f"{partial.elapsed_seconds:.3f} s", file=sys.stderr)
+        return 130 if exc.reason == "cancelled" else 1
     print("\nResults")
     print(f"Average request time: {summary.average_seconds:.3f} s")
     print(

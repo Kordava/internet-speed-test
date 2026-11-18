@@ -195,7 +195,7 @@ def process_alive(pid):
         return False
 
 
-class CLIReliabilityTests(unittest.TestCase):
+class CLIHarness(unittest.TestCase):
     def cli(self, server, args=(), cancel=False, env_extra=None, trust=True):
         env = os.environ.copy()
         for key in list(env):
@@ -256,14 +256,14 @@ class CLIReliabilityTests(unittest.TestCase):
         self.assertNotIn("Traceback", stdout + stderr)
         return process.returncode, stdout, stderr, time.monotonic() - started
 
-    def assert_stopped(self, result, reason, completed, partial=3, forced=False):
+    def assert_stopped(self, result, reason, completed, partial=3, forced=False, count=10):
         code, out, err, duration = result
         self.assertEqual(code, 130 if reason == "cancelled" else 1, (out, err))
         self.assertIn(reason, err)
         self.assertNotIn("Results", out)
         self.assertNotIn("Download speed:", out)
-        self.assertIn(f"Completed: {completed}/10 requests, {completed * 3} bytes,", err)
-        self.assertEqual(len(re.findall(r"Request \d\d/10:", out)), completed)
+        self.assertIn(f"Completed: {completed}/{count} requests, {completed * 3} bytes,", err)
+        self.assertEqual(len(re.findall(rf"Request \d\d/{count}:", out)), completed)
         prefix = "at least " if forced else ""
         match = re.search(rf"Partial request {completed + 1}: {prefix}([\d,]+) bytes", err)
         self.assertIsNotNone(match, err)
@@ -274,6 +274,7 @@ class CLIReliabilityTests(unittest.TestCase):
             self.assertEqual(count, partial)
         self.assertLess(duration, 8)
 
+class CLIReliabilityTests(CLIHarness):
     def test_complete_http_https_domain(self):
         for tls, framing, body in itertools.product((False, True), ("fixed", "chunked", "eof"), (b"", b"abc")):
             with self.subTest(tls=tls, framing=framing, body=body):
@@ -493,27 +494,334 @@ class CLIReliabilityTests(unittest.TestCase):
                 self.assert_stopped(self.cli(server), "network_error", 0, partial=0)
 
 
-def crash_worker(sender, url, timeout):
+class CLIControlsTests(CLIHarness):
+    def test_complete_budget_domain(self):
+        for tls, framing, count, mode, body in itertools.product(
+            (False, True), ("fixed", "chunked", "eof"), (10, 3),
+            ("none", "time", "bytes", "both"), (b"", b"abc"),
+        ):
+            with self.subTest(tls=tls, framing=framing, count=count, mode=mode, body=body):
+                def scenario(sock, index, path, server):
+                    response(sock, *framed(framing, body))
+                args = [] if count == 10 else ["--count", str(count)]
+                if mode in ("time", "both"):
+                    args += ["--max-time", "10"]
+                if mode in ("bytes", "both"):
+                    args += ["--max-bytes", str(count * len(body) + 1)]
+                with RawServer(scenario, tls) as server:
+                    code, out, err, _ = self.cli(server, args)
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(server.paths, ["/"] * count)
+                    self.assertEqual(server.maximum_active, 1)
+                    self.assertIn(f"Total downloaded:     {count * len(body)} bytes", out)
+                    self.assertEqual(len(re.findall(rf"Request \d\d/{count}:", out)), count)
+                    self.assertIn("Results", out)
+
+    def test_stopped_budget_domain(self):
+        for tls, framing, completed, mode in itertools.product(
+            (False, True), ("fixed", "chunked", "eof"), (0, 2),
+            ("time", "bytes", "both_time", "both_bytes"),
+        ):
+            with self.subTest(tls=tls, framing=framing, completed=completed, mode=mode):
+                def scenario(sock, index, path, server):
+                    if index <= completed:
+                        response(sock, *framed(framing))
+                        return
+                    headers = {"fixed": b"Content-Length: 1000000\r\n",
+                               "chunked": b"Transfer-Encoding: chunked\r\n", "eof": b""}[framing]
+                    response(sock, headers, b"f4240\r\nabc" if framing == "chunked" else b"abc")
+                    while not server.stop.wait(.03):
+                        sock.sendall(b"x")
+                time_first = mode in ("time", "both_time")
+                args = ["--count", "4", "--download-timeout", "5"]
+                if mode != "bytes":
+                    args += ["--max-time", "1.2" if time_first else "5"]
+                if mode != "time":
+                    args += ["--max-bytes", "100000000" if time_first else str(completed * 3 + 3)]
+                with RawServer(scenario, tls) as server:
+                    result = self.cli(server, args)
+                    self.assert_stopped(result, "time_limit" if time_first else "byte_limit",
+                                        completed, forced=time_first, count=4)
+                    self.assertEqual(server.paths, ["/"] * (completed + 1))
+                    self.assertEqual(server.maximum_active, 1)
+
+    def test_byte_boundaries_and_block_sizes(self):
+        for tls, framing, size, delta in itertools.product(
+            (False, True), ("fixed", "chunked", "eof"), (3, 65539), (-1, 0, 1),
+        ):
+            with self.subTest(tls=tls, framing=framing, size=size, delta=delta):
+                body = b"x" * size
+                cap = size + delta
+                def scenario(sock, index, path, server):
+                    response(sock, *framed(framing, body))
+                with RawServer(scenario, tls) as server:
+                    code, out, err, _ = self.cli(server, ["--count", "1", "--max-bytes", str(cap)])
+                    complete = delta > 0 or (delta == 0 and framing == "fixed")
+                    self.assertEqual(code, 0 if complete else 1, (out, err))
+                    self.assertEqual(server.paths, ["/"])
+                    if complete:
+                        self.assertIn(f"Total downloaded:     {size:,} bytes", out)
+                    else:
+                        self.assertIn("byte_limit", err)
+                        self.assertIn(f"Partial request 1: {cap:,} bytes", err)
+                        self.assertIn("Completed: 0/1 requests", err)
+                        self.assertNotIn("Results", out)
+
+    def test_between_requests_and_empty_204(self):
+        for tls in (False, True):
+            with self.subTest(tls=tls):
+                with RawServer(lambda s, i, p, srv: response(s), tls) as server:
+                    code, out, err, _ = self.cli(server, ["--count", "3", "--max-bytes", "3"])
+                    self.assertEqual(code, 1)
+                    self.assertIn("Series stopped: byte_limit", err)
+                    self.assertIn("Completed: 1/3 requests, 3 bytes", err)
+                    self.assertNotIn("Partial request", err)
+                    self.assertNotIn("Results", out)
+                    self.assertEqual(server.paths, ["/"])
+                with RawServer(lambda s, i, p, srv: response(s, b"", b"", 204), tls) as server:
+                    code, out, err, _ = self.cli(server, ["--count", "3", "--max-bytes", "1"])
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(len(server.paths), 3)
+                    self.assertIn("Total downloaded:     0 bytes", out)
+
+    def test_redirect_bodies_do_not_use_budget(self):
+        for tls in (False, True):
+            def scenario(sock, index, path, server):
+                if path == "/":
+                    response(sock, b"Location: /end\r\nContent-Length: 1000\r\n", b"x" * 1000, 302)
+                else:
+                    response(sock)
+            with self.subTest(tls=tls), RawServer(scenario, tls) as server:
+                code, out, err, _ = self.cli(server, ["--count", "1", "--max-bytes", "3"])
+                self.assertEqual(code, 0, err)
+                self.assertIn("Total downloaded:     3 bytes", out)
+                self.assertEqual(server.paths, ["/", "/end"])
+
+    def test_errors_before_cap_and_custom_count_cancellation(self):
+        cases = ((b"Content-Length: 10\r\n", b"ab", "incomplete_response", 2),
+                 (b"Transfer-Encoding: chunked\r\n", b"2\r\nabXX", "protocol_error", 2),
+                 (b"Content-Length: 3\r\n", b"abc", "cancelled", 3))
+        for tls, (headers, body, reason, partial) in itertools.product((False, True), cases):
+            if reason == "cancelled" and os.name != "posix":
+                continue
+            with self.subTest(tls=tls, reason=reason):
+                def scenario(sock, index, path, server):
+                    if index <= 2:
+                        response(sock)
+                        return
+                    response(sock, b"Content-Length: 1000\r\n" if reason == "cancelled" else headers, body)
+                    server.ready.set()
+                    if reason == "cancelled":
+                        server.stop.wait(4)
+                with RawServer(scenario, tls) as server:
+                    self.assert_stopped(self.cli(server, ["--count", "4", "--max-bytes", "100"],
+                                                 cancel=reason == "cancelled"), reason, 2,
+                                        partial=partial, forced=reason == "cancelled", count=4)
+                    self.assertEqual(len(server.paths), 3)
+
+    def test_global_deadline_covers_transport_setup(self):
+        def stall(sock, index, path, server):
+            server.stop.wait(3)
+        for stage in ("headers", "tls", "dns", "connect"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temp:
+                extra = {}
+                if stage in ("dns", "connect"):
+                    target = "socket.getaddrinfo" if stage == "dns" else "socket.socket.connect"
+                    Path(temp, "sitecustomize.py").write_text(
+                        f"import socket,time\ndef stall(*a, **k):\n time.sleep(10)\n{target}=stall\n"
+                    )
+                    extra["PYTHONPATH"] = temp
+                with RawServer(stall) as server:
+                    if stage == "tls":
+                        server.url = server.url.replace("http:", "https:")
+                    self.assert_stopped(self.cli(server, ["--max-time", ".4"], env_extra=extra),
+                                        "time_limit", 0, partial=0, forced=True)
+                    if stage in ("dns", "connect", "tls"):
+                        self.assertEqual(server.paths, [])
+
+
+def crash_worker(sender, url, timeout, max_bytes=None):
     os._exit(7)
 
 
-def partial_ipc_worker(sender, url, timeout):
+def partial_ipc_worker(sender, url, timeout, max_bytes=None):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     os.write(sender.fileno(), struct.pack("!i", 500) + b"unfinished")
     time.sleep(10)
 
 
-def timed_worker(sender, url, timeout):
+def timed_worker(sender, url, timeout, max_bytes=None):
     time.sleep(.2)
     sender.send(speed_test._Complete(speed_test.Download(.0125, 3)))
     sender.close()
 
 
-def stubborn_worker(sender, url, timeout):
+def stubborn_worker(sender, url, timeout, max_bytes=None):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     sender.send(speed_test._Progress(3))
     time.sleep(10)
+
+
+class ControlsUnitTests(unittest.TestCase):
+    def test_invalid_budget_values_never_start_measurement(self):
+        cases = []
+        for flag in ("--count", "--max-bytes", "--max-time"):
+            values = ("0", "-1", "nan", "inf", "-inf", "bad", "", "1MiB")
+            if flag != "--max-time":
+                values += ("1.5", "1e3")
+            cases += [["http://localhost/", flag, value] for value in values]
+            cases.append(["http://localhost/", flag])
+        cases += [["http://localhost/", "--count", "3", "--max-time", "2", "--max-bytes", "0"],
+                  ["http://localhost/", "--count", "0", "--max-time", "2", "--max-bytes", "3"],
+                  ["http://localhost/", "--count", "3", "--max-time", "nan", "--max-bytes", "3"]]
+        with mock.patch.object(speed_test, "measure") as operation:
+            for argv in cases:
+                with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as caught:
+                        main(argv)
+                    self.assertEqual(caught.exception.code, 2)
+            operation.assert_not_called()
+
+    def test_large_valid_budgets_do_not_overflow(self):
+        with mock.patch.object(speed_test, "_download_worker", timed_worker):
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = measure("http://localhost/", count=1, max_time=1e300, max_bytes=10**100)
+        self.assertEqual(result.total_bytes, 3)
+        summary = speed_test.Summary((speed_test.Download(1, 3),))
+        with mock.patch.object(speed_test, "measure", return_value=summary) as operation:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["http://localhost/", "--count", str(10**100),
+                                       "--max-time", "1e300", "--max-bytes", str(10**100)]), 0)
+            self.assertEqual(operation.call_args.kwargs["count"], 10**100)
+            self.assertEqual(operation.call_args.kwargs["max_bytes"], 10**100)
+
+    def test_reader_never_returns_payload_beyond_cap(self):
+        for framing, size, cap in itertools.product(("fixed", "chunked", "eof"), (3, 65539), (2, 3, 65538, 65539, 65540)):
+            with self.subTest(framing=framing, size=size, cap=cap):
+                headers, body = framed(framing, b"x" * size)
+                sock = mock.Mock()
+                sock.makefile.return_value = io.BytesIO(b"HTTP/1.1 200 OK\r\n" + headers + b"\r\n" + body)
+                reply = speed_test._StrictResponse(sock)
+                reply.begin()
+                actual_read = reply.read1
+                delivered = 0
+                def bounded_read(n):
+                    nonlocal delivered
+                    self.assertLessEqual(n, cap - delivered)
+                    self.assertGreater(n, 0)
+                    data = actual_read(n)
+                    delivered += len(data)
+                    self.assertLessEqual(delivered, cap)
+                    return data
+                reply.read1 = bounded_read
+                sender = mock.Mock()
+                opener = mock.Mock()
+                opener.open.return_value = reply
+                with mock.patch.object(speed_test, "build_opener", return_value=opener):
+                    with mock.patch.object(speed_test.signal, "signal"):
+                        speed_test._download_worker(sender, "http://localhost/", 1, cap)
+                messages = [call.args[0] for call in sender.send.call_args_list]
+                terminal = messages[-1]
+                complete = size < cap or (size == cap and framing == "fixed")
+                self.assertIsInstance(terminal, speed_test._Complete if complete else speed_test._Failure)
+                if not complete:
+                    self.assertEqual(terminal.reason, "byte_limit")
+                    self.assertEqual(terminal.bytes_downloaded, cap)
+                    self.assertTrue(terminal.exact_bytes)
+                self.assertEqual(delivered, min(size, cap))
+                sender.close.assert_called_once()
+
+    def test_shared_deadline_includes_attempts_cleanup_and_progress(self):
+        for overhead in ("cleanup", "progress"):
+            with self.subTest(overhead=overhead):
+                clock = [10.0]
+                def attempt(*args, **kwargs):
+                    clock[0] += .3 if overhead == "cleanup" else .1
+                    return speed_test.Download(.01, 3)
+                def output(*args, **kwargs):
+                    if overhead == "progress":
+                        clock[0] += .2
+                with mock.patch.object(speed_test, "perf_counter", side_effect=lambda: clock[0]):
+                    with mock.patch.object(speed_test, "download_once", side_effect=attempt) as download:
+                        with mock.patch("builtins.print", side_effect=output):
+                            with self.assertRaises(speed_test.DownloadError) as caught:
+                                measure("http://localhost/", count=3, max_time=.25, max_bytes=3)
+                self.assertEqual(caught.exception.reason, "time_limit")  # Time wins between attempts.
+                self.assertIsNone(caught.exception.partial)
+                self.assertEqual(caught.exception.requested_count, 3)
+                self.assertEqual(len(caught.exception.downloads), 1)
+                self.assertEqual(download.call_count, 1)
+                self.assertEqual(download.call_args.kwargs, {"series_deadline": 10.25, "max_bytes": 3})
+
+    def test_remaining_budget_and_absolute_deadline_are_forwarded(self):
+        clock = [10.0]
+        def attempt(*args, **kwargs):
+            clock[0] += .1
+            return speed_test.Download(.01, 3)
+        with mock.patch.object(speed_test, "perf_counter", side_effect=lambda: clock[0]):
+            with mock.patch.object(speed_test, "download_once", side_effect=attempt) as download:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    result = measure("http://localhost/", count=3, max_time=1, max_bytes=10)
+        self.assertEqual(result.total_bytes, 9)
+        self.assertEqual([call.kwargs["max_bytes"] for call in download.call_args_list], [10, 7, 4])
+        self.assertEqual([call.kwargs["series_deadline"] for call in download.call_args_list], [11.0] * 3)
+
+    def test_late_terminal_and_equal_deadline_precedence(self):
+        for terminal in (speed_test._Complete(speed_test.Download(.1, 3)),
+                         speed_test._Failure("byte_limit", "cap", 3, .1)):
+            for series_deadline, expected in ((1, "time_limit"), (2, "download_timeout")):
+                with self.subTest(terminal=terminal, series_deadline=series_deadline):
+                    messages = speed_test.queue.Queue()
+                    messages.put(terminal)
+                    context = mock.Mock()
+                    context.Pipe.return_value = (mock.Mock(), mock.Mock())
+                    with mock.patch.object(speed_test, "perf_counter", side_effect=[0, 0, 1, 1, 1]):
+                        with mock.patch.object(speed_test.multiprocessing, "get_context", return_value=context):
+                            with mock.patch.object(speed_test.threading, "Thread"), mock.patch.object(speed_test, "_cleanup", return_value=True):
+                                with mock.patch.object(speed_test.queue, "Queue", return_value=messages):
+                                    with self.assertRaises(speed_test.DownloadError) as caught:
+                                        speed_test.download_once("http://localhost/", 1, 1, series_deadline=series_deadline)
+                    self.assertEqual(caught.exception.reason, expected)
+
+    def test_terminal_before_deadline_keeps_reason_and_cleanup_can_override(self):
+        for clean in (True, False):
+            messages = speed_test.queue.Queue()
+            messages.put(speed_test._Failure("byte_limit", "cap", 3, .1))
+            context = mock.Mock()
+            context.Pipe.return_value = (mock.Mock(), mock.Mock())
+            with mock.patch.object(speed_test, "perf_counter", return_value=0):
+                with mock.patch.object(speed_test.multiprocessing, "get_context", return_value=context):
+                    with mock.patch.object(speed_test.threading, "Thread"), mock.patch.object(speed_test, "_cleanup", return_value=clean):
+                        with mock.patch.object(speed_test.queue, "Queue", return_value=messages):
+                            with self.assertRaises(speed_test.DownloadError) as caught:
+                                speed_test.download_once("http://localhost/", 1, series_deadline=1)
+            self.assertEqual(caught.exception.reason, "byte_limit" if clean else "worker_error")
+            self.assertEqual(caught.exception.partial.bytes_downloaded, 3)
+
+    def test_expired_deadline_never_spawns_and_last_completion_survives_cleanup(self):
+        with mock.patch.object(speed_test, "perf_counter", return_value=10):
+            with mock.patch.object(speed_test.multiprocessing, "get_context") as context:
+                with self.assertRaises(speed_test.DownloadError) as caught:
+                    speed_test.download_once("http://localhost/", 1, series_deadline=10)
+            context.assert_not_called()
+            self.assertIsNone(caught.exception.partial)
+            self.assertEqual(caught.exception.reason, "time_limit")
+        clock = [0.0]
+        messages = speed_test.queue.Queue()
+        messages.put(speed_test._Complete(speed_test.Download(.1, 3)))
+        context = mock.Mock()
+        context.Pipe.return_value = (mock.Mock(), mock.Mock())
+        def slow_cleanup(*args):
+            clock[0] = 2.0
+            return True
+        with mock.patch.object(speed_test, "perf_counter", side_effect=lambda: clock[0]):
+            with mock.patch.object(speed_test.multiprocessing, "get_context", return_value=context):
+                with mock.patch.object(speed_test.threading, "Thread"), mock.patch.object(speed_test, "_cleanup", side_effect=slow_cleanup):
+                    with mock.patch.object(speed_test.queue, "Queue", return_value=messages):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            result = measure("http://localhost/", count=1, max_time=1)
+        self.assertEqual(result.total_bytes, 3)
 
 
 class SupervisorTests(unittest.TestCase):
@@ -579,7 +887,8 @@ class SupervisorTests(unittest.TestCase):
             with mock.patch("builtins.print", side_effect=KeyboardInterrupt):
                 with self.assertRaises(speed_test.DownloadError) as caught:
                     measure("http://localhost/")
-        self.assertEqual(caught.exception.partial.reason, "cancelled")
+        self.assertEqual(caught.exception.reason, "cancelled")
+        self.assertIsNone(caught.exception.partial)
         self.assertEqual(len(caught.exception.downloads), 1)
 
     def test_large_deadline_does_not_overflow_queue_wait(self):
