@@ -23,6 +23,7 @@ from tests import test_speed_test as support
 
 
 def clean_environment():
+    """Isolate installation checks from Python and pip environment settings."""
     env = os.environ.copy()
     for key in ("PYTHONPATH", "PYTHONHOME"):
         env.pop(key, None)
@@ -32,6 +33,7 @@ def clean_environment():
 
 
 def run(args, cwd, env=None):
+    """Run an isolated command and fail with captured diagnostics."""
     result = subprocess.run(args, cwd=cwd, env=env or clean_environment(),
                             capture_output=True, text=True, timeout=120)
     if result.returncode:
@@ -41,6 +43,7 @@ def run(args, cwd, env=None):
 
 
 def setUpModule():
+    """Build and install an offline wheel in a clean runtime environment."""
     for name, minimum in (("pip", (22, 3)), ("setuptools", (70, 1))):
         try:
             version = importlib.metadata.version(name)
@@ -80,36 +83,52 @@ def setUpModule():
 
 
 class InstalledCommand:
+    """Configure inherited CLI tests to use the installed command."""
+
     @classmethod
     def setUpClass(cls):
+        """Select the installed command and an unrelated working directory."""
         super().setUpClass()
         cls.command = command
         cls.cwd = outside
 
 
 class InstalledReliabilityTests(InstalledCommand, support.CLIReliabilityTests):
+    """Check transport reliability through the installed command."""
+
     pass
 
 
 class InstalledJSONReliabilityTests(InstalledCommand, support.JSONReliabilityTests):
+    """Check installed transport reliability with JSON reporting."""
+
     pass
 
 
 class InstalledControlsTests(InstalledCommand, support.CLIControlsTests):
+    """Check measurement budgets through the installed command."""
+
     pass
 
 
 class InstalledJSONControlsTests(InstalledCommand, support.JSONControlsTests):
+    """Check installed measurement budgets with JSON reporting."""
+
     pass
 
 
 class InstalledReportingTests(InstalledCommand, support.CLIHarness):
+    """Check real measurements and startup failures after installation."""
+
     test_real_short_and_long_measurements = support.ReportingTests.test_real_short_and_long_measurements
     test_cli_worker_start_failure_in_both_formats = support.ReportingTests.test_cli_worker_start_failure_in_both_formats
 
 
 class InstallationTests(unittest.TestCase):
+    """Check wheel contents, runtime isolation, and command entry points."""
+
     def test_wheel_metadata_entry_point_and_contents(self):
+        """Verify wheel metadata, command registration, and packaged source."""
         with zipfile.ZipFile(wheel) as archive:
             names = archive.namelist()
             metadata = email.parser.Parser().parsestr(archive.read(
@@ -126,6 +145,7 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual(archive.read("speed_test.py"), (support.ROOT / "speed_test.py").read_bytes())
 
     def test_import_comes_from_clean_runtime_site_packages(self):
+        """Verify imports use the installed package in a clean runtime."""
         result = run([str(runtime_python), "-I", "-c",
                       "import json, speed_test, importlib.util; "
                       "print(json.dumps([speed_test.__file__, "
@@ -138,6 +158,7 @@ class InstallationTests(unittest.TestCase):
         self.assertTrue(no_setuptools)
 
     def test_installed_help_and_invalid_arguments(self):
+        """Verify installed command help and argument validation."""
         for args, code in ((["--help"], 0), ([], 2), (["ftp://localhost/"], 2),
                            (["http://localhost/", "--count", "0", "--json"], 2),
                            (["http://localhost/", "--unknown"], 2)):
@@ -154,6 +175,7 @@ class InstallationTests(unittest.TestCase):
                     self.assertIn("error:", result.stderr)
 
     def test_common_entry_returns_main_status_and_handles_interrupt(self):
+        """Verify the shared entry point preserves status and handles interrupts."""
         with mock.patch.object(speed_test, "main", return_value=1) as main:
             self.assertEqual(speed_test.cli(), 1)
             main.assert_called_once_with()
@@ -164,6 +186,7 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual(err.getvalue(), "\nInterrupted\n")
 
     def test_outer_interrupt_through_both_real_entry_points(self):
+        """Verify both real entry points handle early interruption consistently."""
         with tempfile.TemporaryDirectory() as temp:
             Path(temp, "sitecustomize.py").write_text(
                 "import argparse\n"

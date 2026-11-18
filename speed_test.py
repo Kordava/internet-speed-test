@@ -39,28 +39,36 @@ Reason = Literal[
 
 @dataclass(frozen=True)
 class Download:
+    """Timing and byte count for a completed download."""
+
     elapsed_seconds: float
     bytes_downloaded: int
 
 
 @dataclass(frozen=True)
 class Summary:
+    """Aggregate measurements from completed downloads."""
+
     downloads: tuple[Download, ...]
 
     @property
     def total_bytes(self) -> int:
+        """Sum the bytes from completed downloads."""
         return sum(item.bytes_downloaded for item in self.downloads)
 
     @property
     def total_seconds(self) -> float:
+        """Sum the durations of completed downloads."""
         return sum(item.elapsed_seconds for item in self.downloads)
 
     @property
     def average_seconds(self) -> float:
+        """Calculate the mean duration of completed downloads."""
         return self.total_seconds / len(self.downloads)
 
     @property
     def speed_mbps(self) -> float:
+        """Calculate aggregate throughput in megabits per second."""
         if self.total_seconds == 0:
             return 0.0
         return self.total_bytes * 8 / self.total_seconds / 1_000_000
@@ -68,6 +76,8 @@ class Summary:
 
 @dataclass(frozen=True)
 class PartialDownload:
+    """Progress and failure details for an unfinished download."""
+
     number: int
     bytes_downloaded: int
     elapsed_seconds: float
@@ -84,6 +94,7 @@ class DownloadError(Exception):
         *, requested_count: int = REQUEST_COUNT, reason: Reason | None = None,
         detail: str | None = None,
     ):
+        """Preserve completed downloads and the reason the series stopped."""
         self.partial = partial
         self.downloads = downloads
         self.requested_count = requested_count
@@ -101,6 +112,8 @@ class DownloadError(Exception):
 
 
 class _ProtocolError(http.client.HTTPException):
+    """Invalid or unsupported HTTP response framing."""
+
     pass
 
 
@@ -108,6 +121,7 @@ class _StrictResponse(http.client.HTTPResponse):
     """Keep stdlib status/headers/transport; validate the body framing strictly."""
 
     def begin(self):
+        """Validate response framing before reading the body."""
         super().begin()
         self._chunk_remaining = 0
         self._need_separator = False
@@ -133,6 +147,7 @@ class _StrictResponse(http.client.HTTPResponse):
             self.length = 0
 
     def _framing_line(self) -> bytes:
+        """Read a bounded framing line with strict CRLF validation."""
         line = self.fp.readline(CHUNK_SIZE + 1)
         if len(line) > CHUNK_SIZE:
             raise _ProtocolError("framing line exceeds 64 KiB")
@@ -143,6 +158,7 @@ class _StrictResponse(http.client.HTTPResponse):
         return line[:-2]
 
     def read1(self, n=CHUNK_SIZE):
+        """Read a bounded body block while enforcing HTTP framing."""
         n = min(n, CHUNK_SIZE) if n >= 0 else CHUNK_SIZE
         if not n or self.fp is None:
             return b""
@@ -181,32 +197,46 @@ class _StrictResponse(http.client.HTTPResponse):
 
 
 class _HTTPConnection(http.client.HTTPConnection):
+    """HTTP connection with strict response framing."""
+
     response_class = _StrictResponse
 
 
 class _HTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection with strict response framing."""
+
     response_class = _StrictResponse
 
 
 class _HTTPHandler(HTTPHandler):
+    """Open HTTP requests with strict response validation."""
+
     def http_open(self, req):
+        """Open a request through the strict HTTP connection."""
         return self.do_open(_HTTPConnection, req)
 
 
 class _HTTPSHandler(HTTPSHandler):
+    """Open HTTPS requests with strict response validation."""
+
     def https_open(self, req):
+        """Open a request through the strict HTTPS connection."""
         return self.do_open(_HTTPSConnection, req, context=self._context)
 
 
 class _ResponseProcessor(HTTPErrorProcessor):
+    """Leave status and redirect handling to the download worker."""
+
     def http_response(self, request, response):
         # Inspect statuses ourselves: urllib's redirect handler reads the body.
+        """Preserve the response for explicit status handling."""
         return response
 
     https_response = http_response
 
 
 def _validate_url(url: str) -> str:
+    """Reject unsupported or malformed URLs before network access."""
     if any(ord(char) <= 32 or ord(char) == 127 for char in url):
         raise ValueError("URL contains whitespace or control characters")
     parts = urlsplit(url)
@@ -224,16 +254,22 @@ def _validate_url(url: str) -> str:
 
 @dataclass(frozen=True)
 class _Progress:
+    """Latest known body byte count from a download worker."""
+
     bytes_downloaded: int
 
 
 @dataclass(frozen=True)
 class _Complete:
+    """Completed download measurement from a worker."""
+
     download: Download
 
 
 @dataclass(frozen=True)
 class _Failure:
+    """Worker failure details and known download progress."""
+
     reason: Reason
     detail: str
     bytes_downloaded: int
@@ -273,6 +309,7 @@ def _failure_reason(exc: Exception) -> Reason:
 def _download_worker(
     sender: Connection, url: str, timeout: float, max_bytes: int | None = None,
 ) -> None:
+    """Download one resource within the byte budget and report progress."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     count = 0
     last_progress_count = 0
@@ -558,6 +595,7 @@ def measure(
 
 
 def positive_seconds(value: str) -> float:
+    """Parse a positive finite duration for command-line limits."""
     try:
         result = float(value)
     except ValueError as exc:
@@ -568,6 +606,7 @@ def positive_seconds(value: str) -> float:
 
 
 def positive_integer(value: str) -> int:
+    """Parse a positive integer for command-line counts and budgets."""
     try:
         result = int(value)
     except ValueError as exc:
@@ -578,6 +617,7 @@ def positive_integer(value: str) -> int:
 
 
 def socket_seconds(value: str) -> float:
+    """Validate a duration against platform socket timeout limits."""
     result = positive_seconds(value)
     try:
         with socket.socket() as probe:
@@ -588,12 +628,16 @@ def socket_seconds(value: str) -> float:
 
 
 class DownloadPayload(TypedDict):
+    """Report fields for a completed download."""
+
     number: int
     elapsed_seconds: float
     bytes_downloaded: int
 
 
 class StatisticsPayload(TypedDict):
+    """Aggregate report statistics for completed downloads."""
+
     total_bytes: int
     total_seconds: float
     average_seconds: float | None
@@ -604,15 +648,21 @@ class StatisticsPayload(TypedDict):
 
 
 class PartialPayload(DownloadPayload):
+    """Report fields for an unfinished attempt and its byte accuracy."""
+
     exact_bytes: bool
 
 
 class ErrorPayload(TypedDict):
+    """Reported reason and details for an incomplete series."""
+
     reason: Reason
     detail: str
 
 
 class _ReportBase(TypedDict):
+    """Shared fields for completed and incomplete measurement reports."""
+
     schema_version: Literal[1]
     url: str
     requested_count: int
@@ -623,12 +673,16 @@ class _ReportBase(TypedDict):
 
 
 class CompletedReport(_ReportBase):
+    """Report for a successfully completed measurement series."""
+
     status: Literal["completed"]
     partial: None
     error: None
 
 
 class IncompleteReport(_ReportBase):
+    """Report for a stopped series with optional partial progress."""
+
     status: Literal["incomplete"]
     partial: PartialPayload | None
     error: ErrorPayload
@@ -670,10 +724,12 @@ def build_report(url: str, result: Summary | DownloadError) -> Report:
 
 
 def _display(value: float | None, precision: int = 3, unit: str = "s") -> str:
+    """Format a measurement with units or mark it unavailable."""
     return "N/A" if value is None else f"{value:.{precision}f} {unit}"
 
 
 def _format_partial(partial: PartialPayload) -> str:
+    """Format partial progress with its byte-count accuracy."""
     accuracy = "" if partial["exact_bytes"] else "at least "
     return (
         f"Partial request {partial['number']}: {accuracy}{partial['bytes_downloaded']:,} bytes, "
@@ -682,6 +738,7 @@ def _format_partial(partial: PartialPayload) -> str:
 
 
 def render_text(report: Report) -> None:
+    """Print a human-readable measurement report."""
     print(f"URL: {report['url']}\n")
     if report["status"] == "completed":
         print("Results")
@@ -708,6 +765,7 @@ def render_text(report: Report) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """Define command-line options and their validation."""
     parser = argparse.ArgumentParser(
         description="Measure download speed using sequential HTTP(S) requests."
     )
@@ -732,6 +790,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the requested measurements and render the final report."""
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
@@ -739,6 +798,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(f"invalid URL: {exc}")
     def progress(number: int, item: Download) -> None:
+        """Write completed-request progress to standard error."""
         print(f"Request {number:02d}/{args.count}: "
               f"{item.elapsed_seconds:.3f} s, {item.bytes_downloaded:,} bytes",
               file=sys.stderr, flush=True)
