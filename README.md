@@ -203,6 +203,27 @@ between requests, and terminal output are excluded from the speed denominator.
 The measured bytes are HTTP body bytes after chunk framing has been removed,
 without decoding Content-Encoding.
 
+## Pre-commit checks
+
+Install the development tool and enable the hook once per checkout, using the
+virtual environment from the installation instructions:
+
+```bash
+python -m pip install pre-commit
+pre-commit install
+pre-commit run --all-files
+```
+
+The hook runs Ruff lint checks targeting Python 3.10, validates TOML and YAML,
+checks for merge conflict markers and private keys, and fixes trailing whitespace
+and missing final newlines. Markdown hard line breaks are preserved. The private
+key check excludes only `tests/fixtures/server-key.pem`, used by the local HTTPS
+test server. Hook versions are pinned in `.pre-commit-config.yaml`.
+
+The first run needs network access to prepare the hook environments. If a hook
+changes files, review and stage those changes before retrying the commit. Tests
+are run separately with the commands below.
+
 ## Tests
 
 Tests use local HTTP/HTTPS servers and **do not require internet access**. TLS is

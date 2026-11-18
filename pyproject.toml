@@ -16,3 +16,9 @@ internet-speed-test = "speed_test:cli"
 [tool.setuptools]
 py-modules = ["speed_test"]
 packages = []
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
