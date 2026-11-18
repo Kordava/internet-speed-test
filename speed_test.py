@@ -2,19 +2,21 @@
 
 import argparse
 import http.client
+import json
 import math
 import multiprocessing
 import queue
 import re
 import signal
 import socket
+import statistics
 import string
 import sys
 import threading
 from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
 from time import perf_counter
-from typing import Literal
+from typing import Callable, Literal, TypedDict
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urljoin, urlsplit
 from urllib.request import HTTPErrorProcessor, HTTPHandler, HTTPSHandler, Request, build_opener
@@ -446,6 +448,7 @@ def measure(
     url: str, timeout: float = DEFAULT_TIMEOUT,
     download_timeout: float = DEFAULT_DOWNLOAD_TIMEOUT,
     *, count: int = REQUEST_COUNT, max_time: float | None = None, max_bytes: int | None = None,
+    progress: Callable[[int, Download], None] | None = None,
 ) -> Summary:
     """Perform sequential downloads until count is complete or a budget stops us."""
     deadline = None if max_time is None else perf_counter() + max_time
@@ -469,11 +472,8 @@ def measure(
                                     reason=exc.reason, detail=exc.detail) from exc
             downloads.append(item)
             total_bytes += item.bytes_downloaded
-            print(
-                f"Request {index:02d}/{count}: "
-                f"{item.elapsed_seconds:.3f} s, {item.bytes_downloaded:,} bytes",
-                flush=True,
-            )
+            if progress is not None:
+                progress(index, item)
     except KeyboardInterrupt:
         raise DownloadError(None, tuple(downloads), requested_count=count,
                             reason="cancelled", detail="interrupted by user") from None
@@ -510,6 +510,120 @@ def socket_seconds(value: str) -> float:
     return result
 
 
+class DownloadPayload(TypedDict):
+    number: int
+    elapsed_seconds: float
+    bytes_downloaded: int
+
+
+class StatisticsPayload(TypedDict):
+    total_bytes: int
+    total_seconds: float
+    average_seconds: float | None
+    min_seconds: float | None
+    median_seconds: float | None
+    max_seconds: float | None
+    speed_mbps: float | None
+
+
+class PartialPayload(DownloadPayload):
+    exact_bytes: bool
+
+
+class ErrorPayload(TypedDict):
+    reason: Reason
+    detail: str
+
+
+class _ReportBase(TypedDict):
+    schema_version: Literal[1]
+    url: str
+    requested_count: int
+    completed_count: int
+    downloads: list[DownloadPayload]
+    statistics: StatisticsPayload
+    warnings: list[Literal["short_measurement"]]
+
+
+class CompletedReport(_ReportBase):
+    status: Literal["completed"]
+    partial: None
+    error: None
+
+
+class IncompleteReport(_ReportBase):
+    status: Literal["incomplete"]
+    partial: PartialPayload | None
+    error: ErrorPayload
+
+
+Report = CompletedReport | IncompleteReport
+
+
+def build_report(url: str, result: Summary | DownloadError) -> Report:
+    """Describe one terminal result; partial attempts never enter statistics."""
+    summary = Summary(result.downloads)
+    times = [item.elapsed_seconds for item in summary.downloads]
+    average = summary.average_seconds if times else None
+    base: _ReportBase = {
+        "schema_version": 1, "url": url,
+        "requested_count": result.requested_count if isinstance(result, DownloadError) else len(times),
+        "completed_count": len(times),
+        "downloads": [DownloadPayload(number=n, elapsed_seconds=item.elapsed_seconds,
+                                      bytes_downloaded=item.bytes_downloaded)
+                      for n, item in enumerate(summary.downloads, 1)],
+        "statistics": {
+            "total_bytes": summary.total_bytes, "total_seconds": summary.total_seconds,
+            "average_seconds": average, "min_seconds": min(times) if times else None,
+            "median_seconds": statistics.median(times) if times else None,
+            "max_seconds": max(times) if times else None,
+            "speed_mbps": summary.speed_mbps if times else None,
+        },
+        "warnings": ["short_measurement"] if average is not None and average < 1.0 else [],
+    }
+    if isinstance(result, DownloadError):
+        partial = result.partial
+        return IncompleteReport(
+            **base, status="incomplete", error={"reason": result.reason, "detail": result.detail},
+            partial=None if partial is None else PartialPayload(
+                number=partial.number, bytes_downloaded=partial.bytes_downloaded,
+                elapsed_seconds=partial.elapsed_seconds, exact_bytes=partial.exact_bytes),
+        )
+    return CompletedReport(**base, status="completed", error=None, partial=None)
+
+
+def _display(value: float | None, precision: int = 3, unit: str = "s") -> str:
+    return "N/A" if value is None else f"{value:.{precision}f} {unit}"
+
+
+def render_text(report: Report) -> None:
+    print(f"URL: {report['url']}\n")
+    if report["status"] == "completed":
+        print("Results")
+    else:
+        print(f"Series incomplete: {report['error']['reason']}: {report['error']['detail']}")
+        print("Completed requests only")
+    print(f"Completed: {report['completed_count']}/{report['requested_count']} requests")
+    for item in report["downloads"]:
+        print(f"Download {item['number']:02d}: {item['elapsed_seconds']:.3f} s, "
+              f"{item['bytes_downloaded']:,} bytes")
+    stats = report["statistics"]
+    print(f"Average request time: {_display(stats['average_seconds'])}")
+    print(f"Min request time:     {_display(stats['min_seconds'])}")
+    print(f"Median request time:  {_display(stats['median_seconds'])}")
+    print(f"Max request time:     {_display(stats['max_seconds'])}")
+    print(f"Total downloaded:     {stats['total_bytes']:,} bytes "
+          f"({stats['total_bytes'] / (1024 ** 2):.2f} MiB)")
+    print(f"Total request time:   {stats['total_seconds']:.3f} s")
+    label = "Download speed:      " if report["status"] == "completed" else "Completed-only speed:"
+    print(f"{label} {_display(stats['speed_mbps'], 2, 'Mbit/s')}")
+    partial = report["partial"]
+    if partial is not None:
+        accuracy = "" if partial["exact_bytes"] else "at least "
+        print(f"Partial request {partial['number']}: {accuracy}{partial['bytes_downloaded']:,} bytes, "
+              f"{partial['elapsed_seconds']:.3f} s")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Measure download speed using sequential HTTP(S) requests."
@@ -530,36 +644,46 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-bytes", type=positive_integer, metavar="BYTES",
                         help="series HTTP body byte cap (default: unlimited); chunked/EOF responses "
                              "at the exact cap remain incomplete without a further read")
+    parser.add_argument("--json", action="store_true", help="write one JSON report to stdout")
     args = parser.parse_args(argv)
     try:
         _validate_url(args.url)
     except ValueError as exc:
         parser.error(f"invalid URL: {exc}")
-    print(f"URL: {args.url}\n", flush=True)
+    def progress(number: int, item: Download) -> None:
+        print(f"Request {number:02d}/{args.count}: "
+              f"{item.elapsed_seconds:.3f} s, {item.bytes_downloaded:,} bytes",
+              file=sys.stderr, flush=True)
+
+    result: Summary | DownloadError
     try:
-        summary = measure(args.url, timeout=args.timeout, download_timeout=args.download_timeout,
-                          count=args.count, max_time=args.max_time, max_bytes=args.max_bytes)
+        result = measure(args.url, timeout=args.timeout, download_timeout=args.download_timeout,
+                         count=args.count, max_time=args.max_time, max_bytes=args.max_bytes,
+                         progress=progress)
     except DownloadError as exc:
-        partial = exc.partial
+        result = exc
         print(f"Error: {exc}", file=sys.stderr)
+    report = build_report(args.url, result)
+    if report["status"] == "incomplete":
+        stats = report["statistics"]
         print(
-            f"Completed: {len(exc.downloads)}/{exc.requested_count} requests, "
-            f"{sum(item.bytes_downloaded for item in exc.downloads):,} bytes, "
-            f"{sum(item.elapsed_seconds for item in exc.downloads):.3f} s", file=sys.stderr,
+            f"Completed: {report['completed_count']}/{report['requested_count']} requests, "
+            f"{stats['total_bytes']:,} bytes, {stats['total_seconds']:.3f} s", file=sys.stderr,
         )
+        partial = report["partial"]
         if partial is not None:
-            accuracy = "" if partial.exact_bytes else "at least "
-            print(f"Partial request {partial.number}: {accuracy}{partial.bytes_downloaded:,} bytes, "
-                  f"{partial.elapsed_seconds:.3f} s", file=sys.stderr)
-        return 130 if exc.reason == "cancelled" else 1
-    print("\nResults")
-    print(f"Average request time: {summary.average_seconds:.3f} s")
-    print(
-        f"Total downloaded:     {summary.total_bytes:,} bytes "
-        f"({summary.total_bytes / (1024 ** 2):.2f} MiB)"
-    )
-    print(f"Total request time:   {summary.total_seconds:.3f} s")
-    print(f"Download speed:       {summary.speed_mbps:.2f} Mbit/s")
+            accuracy = "" if partial["exact_bytes"] else "at least "
+            print(f"Partial request {partial['number']}: {accuracy}{partial['bytes_downloaded']:,} bytes, "
+                  f"{partial['elapsed_seconds']:.3f} s", file=sys.stderr)
+    if report["warnings"]:
+        print("Warning: average completed request time is below 1 s; the result depends more on "
+              "latency and does not guarantee a bandwidth estimate.", file=sys.stderr)
+    if args.json:
+        print(json.dumps(report, allow_nan=False))
+    else:
+        render_text(report)
+    if report["status"] == "incomplete":
+        return 130 if report["error"]["reason"] == "cancelled" else 1
     return 0
 
 

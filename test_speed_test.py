@@ -3,6 +3,7 @@
 import contextlib
 import io
 import itertools
+import json
 import os
 import re
 import signal
@@ -18,6 +19,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import get_args
 from unittest import mock
 
 import speed_test
@@ -196,6 +198,8 @@ def process_alive(pid):
 
 
 class CLIHarness(unittest.TestCase):
+    json_mode = False
+
     def cli(self, server, args=(), cancel=False, env_extra=None, trust=True):
         env = os.environ.copy()
         for key in list(env):
@@ -206,7 +210,8 @@ class CLIHarness(unittest.TestCase):
             env["SSL_CERT_FILE"] = str(FIXTURES / "ca.pem")
         env.update(env_extra or {})
         process = subprocess.Popen(
-            [sys.executable, "-u", str(ROOT / "speed_test.py"), server.url, *args],
+            [sys.executable, "-u", str(ROOT / "speed_test.py"), server.url, *args,
+             *(["--json"] if self.json_mode else [])],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
             start_new_session=os.name == "posix",
         )
@@ -254,7 +259,67 @@ class CLIHarness(unittest.TestCase):
         for pid in pids:
             self.assertFalse(process_alive(pid), f"live child {pid} after CLI exit: {roles.get(pid)}")
         self.assertNotIn("Traceback", stdout + stderr)
+        if self.json_mode:
+            self.assert_json_report(stdout, process.returncode, stderr)
         return process.returncode, stdout, stderr, time.monotonic() - started
+
+    def assert_json_report(self, out, code, err):
+        report = json.loads(out)  # Reject extra documents and console output.
+        self.assertTrue(out.endswith("\n"))
+        self.assertEqual(set(report), {"schema_version", "url", "status", "requested_count",
+                                      "completed_count", "downloads", "statistics", "partial",
+                                      "error", "warnings"})
+        self.assertEqual(report["schema_version"], 1)
+        self.assertEqual(report["status"], "completed" if code == 0 else "incomplete")
+        items = report["downloads"]
+        self.assertEqual(report["completed_count"], len(items))
+        self.assertEqual([item["number"] for item in items], list(range(1, len(items) + 1)))
+        times = sorted(item["elapsed_seconds"] for item in items)
+        stats = report["statistics"]
+        self.assertEqual(stats["total_bytes"], sum(item["bytes_downloaded"] for item in items))
+        self.assertAlmostEqual(stats["total_seconds"], sum(times))
+        if items:
+            n = len(times)
+            self.assertAlmostEqual(stats["average_seconds"], sum(times) / n)
+            self.assertEqual(stats["min_seconds"], times[0])
+            self.assertEqual(stats["max_seconds"], times[-1])
+            self.assertEqual(stats["median_seconds"], (times[(n - 1) // 2] + times[n // 2]) / 2)
+            expected_speed = stats["total_bytes"] / sum(times) / 125000 if sum(times) else 0
+            self.assertAlmostEqual(stats["speed_mbps"], expected_speed)
+        else:
+            self.assertEqual(stats, dict(total_bytes=0, total_seconds=0, average_seconds=None,
+                                         min_seconds=None, median_seconds=None, max_seconds=None,
+                                         speed_mbps=None))
+        short = bool(items) and stats["average_seconds"] < 1
+        self.assertEqual(report["warnings"], ["short_measurement"] if short else [])
+        self.assertEqual(err.count("Warning:"), int(short))
+        if code == 0:
+            self.assertIsNone(report["error"])
+            self.assertIsNone(report["partial"])
+            self.assertEqual(len(items), report["requested_count"])
+        else:
+            self.assertIn(report["error"]["reason"], err)
+            self.assertEqual(code, 130 if report["error"]["reason"] == "cancelled" else 1)
+        for item in items:
+            self.assertIs(type(item["bytes_downloaded"]), int)
+        partial = report["partial"]
+        if partial is not None:
+            self.assertIs(type(partial["exact_bytes"]), bool)
+            self.assertIs(type(partial["bytes_downloaded"]), int)
+        self.assertNotRegex(out, r"\b(?:NaN|Infinity)\b")
+        return report
+
+    def assert_total(self, out, total):
+        if self.json_mode:
+            self.assertEqual(json.loads(out)["statistics"]["total_bytes"], total)
+        else:
+            self.assertIn(f"Total downloaded:     {total:,} bytes", out)
+
+    def assert_complete(self, out):
+        if self.json_mode:
+            self.assertEqual(json.loads(out)["status"], "completed")
+        else:
+            self.assertIn("Results", out)
 
     def assert_stopped(self, result, reason, completed, partial=3, forced=False, count=10):
         code, out, err, duration = result
@@ -263,16 +328,28 @@ class CLIHarness(unittest.TestCase):
         self.assertNotIn("Results", out)
         self.assertNotIn("Download speed:", out)
         self.assertIn(f"Completed: {completed}/{count} requests, {completed * 3} bytes,", err)
-        self.assertEqual(len(re.findall(rf"Request \d\d/{count}:", out)), completed)
+        self.assertEqual(len(re.findall(rf"Request \d\d/{count}:", err)), completed)
         prefix = "at least " if forced else ""
         match = re.search(rf"Partial request {completed + 1}: {prefix}([\d,]+) bytes", err)
         self.assertIsNotNone(match, err)
-        count = int(match[1].replace(",", ""))
+        partial_bytes = int(match[1].replace(",", ""))
         if forced:
-            self.assertGreaterEqual(count, partial)
+            self.assertGreaterEqual(partial_bytes, partial)
         else:
-            self.assertEqual(count, partial)
+            self.assertEqual(partial_bytes, partial)
         self.assertLess(duration, 8)
+        if self.json_mode:
+            report = json.loads(out)
+            self.assertEqual(report["error"]["reason"], reason)
+            self.assertEqual(report["completed_count"], completed)
+            self.assertEqual(report["requested_count"], count)
+            self.assertEqual(report["partial"]["number"], completed + 1)
+            self.assertEqual(report["partial"]["exact_bytes"], not forced)
+            self.assertEqual(report["partial"]["bytes_downloaded"], int(match[1].replace(",", "")))
+        else:
+            self.assertIn("Series incomplete", out)
+            self.assertIn("Completed requests only", out)
+            self.assertIn("Completed-only speed:", out)
 
 class CLIReliabilityTests(CLIHarness):
     def test_complete_http_https_domain(self):
@@ -285,9 +362,9 @@ class CLIReliabilityTests(CLIHarness):
                     self.assertEqual(code, 0, err)
                     self.assertEqual(server.paths, ["/"] * 10)
                     self.assertEqual(server.maximum_active, 1)
-                    self.assertIn(f"Total downloaded:     {len(body) * 10} bytes", out)
-                    self.assertEqual(len(re.findall(r"Request \d\d/10:", out)), 10)
-                    self.assertIn("Results", out)
+                    self.assert_total(out, len(body) * 10)
+                    self.assertEqual(len(re.findall(r"Request \d\d/10:", err)), 10)
+                    self.assert_complete(out)
 
     def test_stop_http_https_domain(self):
         for tls, framing, cause, completed in itertools.product(
@@ -370,7 +447,7 @@ class CLIReliabilityTests(CLIHarness):
                 with RawServer(lambda s, i, p, srv: response(s, headers, body, status), tls) as server:
                     code, out, err, _ = self.cli(server)
                     self.assertEqual(code, 0, err)
-                    self.assertIn(f"Total downloaded:     {count * 10} bytes", out)
+                    self.assert_total(out, count * 10)
 
     def test_http_errors_keep_completed_prefix(self):
         for tls, completed, status in itertools.product((False, True), (0, 2), (304, 404, 503)):
@@ -395,7 +472,7 @@ class CLIReliabilityTests(CLIHarness):
                     code, out, err, _ = self.cli(server, ["--timeout", ".3"])
                     self.assertEqual(code, 0, err)
                     self.assertEqual(server.paths, ["/", "/new%20path"] * 10)
-                    self.assertIn("Total downloaded:     30 bytes", out)
+                    self.assert_total(out, 30)
 
     def test_redirect_limits_and_invalid_targets(self):
         for tls, target in itertools.product((False, True), (None, "ftp://example.com/file", "http://", "http://localhost:bad/", "/bad\x01", "/loop")):
@@ -415,7 +492,7 @@ class CLIReliabilityTests(CLIHarness):
                 code, out, err, _ = self.cli(server)
                 self.assertEqual(code, 0, err)
                 self.assertEqual(len(server.paths), 110)
-                self.assertIn("Total downloaded:     30 bytes", out)
+                self.assert_total(out, 30)
 
     def test_redirect_time_is_measured_and_deadline_is_not_reset(self):
         for tls in (False, True):
@@ -428,7 +505,7 @@ class CLIReliabilityTests(CLIHarness):
             with RawServer(scenario, tls) as server:
                 code, out, err, _ = self.cli(server)
                 self.assertEqual(code, 0, err)
-                times = re.findall(r"Request \d\d/10: ([\d.]+) s", out)
+                times = re.findall(r"Request \d\d/10: ([\d.]+) s", err)
                 self.assertEqual(len(times), 10)
                 self.assertTrue(all(float(value) >= .24 for value in times))
             def redirect_loop(sock, index, path, server):
@@ -513,9 +590,9 @@ class CLIControlsTests(CLIHarness):
                     self.assertEqual(code, 0, err)
                     self.assertEqual(server.paths, ["/"] * count)
                     self.assertEqual(server.maximum_active, 1)
-                    self.assertIn(f"Total downloaded:     {count * len(body)} bytes", out)
-                    self.assertEqual(len(re.findall(rf"Request \d\d/{count}:", out)), count)
-                    self.assertIn("Results", out)
+                    self.assert_total(out, count * len(body))
+                    self.assertEqual(len(re.findall(rf"Request \d\d/{count}:", err)), count)
+                    self.assert_complete(out)
 
     def test_stopped_budget_domain(self):
         for tls, framing, completed, mode in itertools.product(
@@ -560,7 +637,7 @@ class CLIControlsTests(CLIHarness):
                     self.assertEqual(code, 0 if complete else 1, (out, err))
                     self.assertEqual(server.paths, ["/"])
                     if complete:
-                        self.assertIn(f"Total downloaded:     {size:,} bytes", out)
+                        self.assert_total(out, size)
                     else:
                         self.assertIn("byte_limit", err)
                         self.assertIn(f"Partial request 1: {cap:,} bytes", err)
@@ -582,7 +659,7 @@ class CLIControlsTests(CLIHarness):
                     code, out, err, _ = self.cli(server, ["--count", "3", "--max-bytes", "1"])
                     self.assertEqual(code, 0, err)
                     self.assertEqual(len(server.paths), 3)
-                    self.assertIn("Total downloaded:     0 bytes", out)
+                    self.assert_total(out, 0)
 
     def test_redirect_bodies_do_not_use_budget(self):
         for tls in (False, True):
@@ -594,7 +671,7 @@ class CLIControlsTests(CLIHarness):
             with self.subTest(tls=tls), RawServer(scenario, tls) as server:
                 code, out, err, _ = self.cli(server, ["--count", "1", "--max-bytes", "3"])
                 self.assertEqual(code, 0, err)
-                self.assertIn("Total downloaded:     3 bytes", out)
+                self.assert_total(out, 3)
                 self.assertEqual(server.paths, ["/", "/end"])
 
     def test_errors_before_cap_and_custom_count_cancellation(self):
@@ -661,6 +738,170 @@ def stubborn_worker(sender, url, timeout, max_bytes=None):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     sender.send(speed_test._Progress(3))
     time.sleep(10)
+
+
+class JSONReliabilityTests(CLIReliabilityTests):
+    json_mode = True
+
+
+class JSONControlsTests(CLIControlsTests):
+    json_mode = True
+
+
+class ReportingTests(CLIHarness):
+    def run_result(self, result, json_mode):
+        out, err = io.StringIO(), io.StringIO()
+        operation = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
+        with mock.patch.object(speed_test, "measure", **operation):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = main(['http://localhost/?q="quoted"&x=\\', *(["--json"] if json_mode else [])])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_identical_terminal_results_in_both_formats(self):
+        # Literal oracles cover zero, one, odd/even and zero-duration sets.
+        fixtures = [
+            ((), (0, 0, None, None, None, None, None)),
+            ((speed_test.Download(.5, 125000),), (125000, .5, .5, .5, .5, .5, 2)),
+            ((speed_test.Download(4., 1000000), speed_test.Download(2., 500000)),
+             (1500000, 6, 3, 2, 3, 4, 2)),
+            ((speed_test.Download(4., 1000000), speed_test.Download(1., 500000),
+              speed_test.Download(7., 1500000)), (3000000, 12, 4, 1, 4, 7, 2)),
+            ((speed_test.Download(0., 3),), (3, 0, 0, 0, 0, 0, 0)),
+        ]
+        for downloads, expected in fixtures:
+            results = [speed_test.DownloadError(None, downloads, requested_count=4,
+                                               reason="cancelled", detail='stop "now"\nnext')]
+            if downloads:
+                results.append(speed_test.Summary(downloads))
+            for result in results:
+                with self.subTest(downloads=downloads, incomplete=isinstance(result, Exception)):
+                    code, raw, err = self.run_result(result, True)
+                    report = self.assert_json_report(raw, code, err)
+                    self.assertEqual(tuple(report["statistics"].values()), expected)
+                    text_code, text, text_err = self.run_result(result, False)
+                    self.assertEqual(text_code, code)
+                    self.assertEqual(text_err, err)
+                    self.assertIn(f"Completed: {len(downloads)}/{report['requested_count']} requests", text)
+                    self.assertIn(f"Total downloaded:     {expected[0]:,} bytes", text)
+                    for key, label in (("average_seconds", "Average request time:"),
+                                       ("min_seconds", "Min request time:"),
+                                       ("median_seconds", "Median request time:"),
+                                       ("max_seconds", "Max request time:"),
+                                       ("total_seconds", "Total request time:"),
+                                       ("speed_mbps", "Download speed:" if code == 0 else "Completed-only speed:")):
+                        line = next(line for line in text.splitlines() if line.startswith(label))
+                        value = report["statistics"][key]
+                        self.assertEqual(line.split(":", 1)[1].strip(), "N/A" if value is None else
+                                         f"{value:.2f} Mbit/s" if key == "speed_mbps" else f"{value:.3f} s")
+                    if code:
+                        self.assertNotIn("Results", text)
+
+    def test_all_reasons_and_partial_provenance(self):
+        for reason, exact in itertools.product(get_args(speed_test.Reason), (False, True)):
+            partial = speed_test.PartialDownload(2, 999999, 500., reason, exact, "detail")
+            result = speed_test.DownloadError(partial, (speed_test.Download(2., 125000),), requested_count=4)
+            for mode in (False, True):
+                with self.subTest(reason=reason, exact=exact, json=mode):
+                    code, out, err = self.run_result(result, mode)
+                    self.assertEqual(code, 130 if reason == "cancelled" else 1)
+                    self.assertIn("Partial request 2: " + ("" if exact else "at least ") + "999,999 bytes", err)
+                    if mode:
+                        report = self.assert_json_report(out, code, err)
+                        self.assertEqual(report["partial"], dict(number=2, bytes_downloaded=999999,
+                                                               elapsed_seconds=500., exact_bytes=exact))
+                        self.assertEqual(report["error"], dict(reason=reason, detail="detail"))
+                        self.assertEqual(report["statistics"]["speed_mbps"], .5)
+                    else:
+                        self.assertIn("Series incomplete", out)
+                        self.assertIn("Completed-only speed: 0.50 Mbit/s", out)
+        # A started zero-byte attempt is present, even with an empty prefix.
+        result = speed_test.DownloadError(speed_test.PartialDownload(1, 0, .1, "network_error", True, "no data"))
+        code, out, err = self.run_result(result, True)
+        self.assertEqual(self.assert_json_report(out, code, err)["partial"]["bytes_downloaded"], 0)
+
+    def test_warning_threshold_and_authoritative_status(self):
+        for seconds in (.999, 1., 1.001):
+            for mode in (False, True):
+                for incomplete in (False, True):
+                    downloads = (speed_test.Download(seconds, 1),)
+                    result = speed_test.DownloadError(None, downloads, requested_count=1,
+                                                     reason="cancelled", detail="after final append") if incomplete else speed_test.Summary(downloads)
+                    code, out, err = self.run_result(result, mode)
+                    self.assertEqual(code, 130 if incomplete else 0)
+                    self.assertEqual(err.count("Warning:"), int(seconds < 1))
+                    if mode:
+                        self.assert_json_report(out, code, err)
+
+    def test_measure_is_silent_and_callback_keeps_last_completion(self):
+        with mock.patch.object(speed_test, "download_once", return_value=speed_test.Download(.2, 3)):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(len(measure("http://localhost/", count=1).downloads), 1)
+            self.assertEqual(out.getvalue(), "")
+            callback = mock.Mock(side_effect=KeyboardInterrupt)
+            with self.assertRaises(speed_test.DownloadError) as caught:
+                measure("http://localhost/", count=1, progress=callback)
+            callback.assert_called_once_with(1, speed_test.Download(.2, 3))
+            self.assertEqual(caught.exception.requested_count, 1)
+            self.assertEqual(len(caught.exception.downloads), 1)
+            self.assertEqual(caught.exception.reason, "cancelled")
+
+    def test_json_rejects_nonfinite_numbers(self):
+        for value in (float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                self.run_result(speed_test.Summary((speed_test.Download(value, 1),)), True)
+
+    def test_help_and_invalid_json_arguments_never_measure(self):
+        for argv, expected in ((["--json", "--help"], 0), (["--json"], 2),
+                               (["http://localhost/", "--json", "--count", "0"], 2)):
+            with mock.patch.object(speed_test, "measure") as operation:
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    with self.assertRaises(SystemExit) as caught:
+                        main(argv)
+                self.assertEqual(caught.exception.code, expected)
+                operation.assert_not_called()
+                if expected == 2:
+                    self.assertEqual(out.getvalue(), "")
+                else:
+                    self.assertIn("--json", out.getvalue())
+
+    def test_real_short_and_long_measurements(self):
+        for mode, delay in itertools.product((False, True), (0, 1.05)):
+            def scenario(sock, index, path, server):
+                time.sleep(delay)
+                response(sock)
+            with self.subTest(json=mode, delay=delay), RawServer(scenario) as server:
+                code, out, err, _ = self.cli(server, ["--count", "1", *(["--json"] if mode else [])])
+                self.assertEqual(code, 0, err)
+                self.assertEqual(err.count("Warning:"), int(delay == 0))
+                if mode:
+                    self.assert_json_report(out, code, err)
+                else:
+                    self.assertIn("Results", out)
+
+    def test_cli_worker_start_failure_in_both_formats(self):
+        with tempfile.TemporaryDirectory() as temp:
+            Path(temp, "sitecustomize.py").write_text(
+                "import multiprocessing.context\n"
+                "def fail(*a, **k):\n raise OSError('out of descriptors')\n"
+                "multiprocessing.context.SpawnContext.Pipe=fail\n"
+            )
+            for mode in (False, True):
+                with self.subTest(json=mode), RawServer(lambda s, i, p, srv: response(s)) as server:
+                    code, out, err, _ = self.cli(server, ["--count", "1", *(["--json"] if mode else [])],
+                                                 env_extra={"PYTHONPATH": temp})
+                    self.assertEqual(code, 1)
+                    self.assertEqual(server.paths, [])
+                    self.assertIn("worker_error", err)
+                    self.assertIn("out of descriptors", err)
+                    if mode:
+                        report = self.assert_json_report(out, code, err)
+                        self.assertEqual(report["partial"]["bytes_downloaded"], 0)
+                        self.assertFalse(report["partial"]["exact_bytes"])
+                    else:
+                        self.assertIn("Series incomplete: worker_error", out)
+                        self.assertIn("Completed-only speed: N/A", out)
 
 
 class ControlsUnitTests(unittest.TestCase):
@@ -744,9 +985,9 @@ class ControlsUnitTests(unittest.TestCase):
                         clock[0] += .2
                 with mock.patch.object(speed_test, "perf_counter", side_effect=lambda: clock[0]):
                     with mock.patch.object(speed_test, "download_once", side_effect=attempt) as download:
-                        with mock.patch("builtins.print", side_effect=output):
-                            with self.assertRaises(speed_test.DownloadError) as caught:
-                                measure("http://localhost/", count=3, max_time=.25, max_bytes=3)
+                        with self.assertRaises(speed_test.DownloadError) as caught:
+                            measure("http://localhost/", count=3, max_time=.25, max_bytes=3,
+                                    progress=output)
                 self.assertEqual(caught.exception.reason, "time_limit")  # Time wins between attempts.
                 self.assertIsNone(caught.exception.partial)
                 self.assertEqual(caught.exception.requested_count, 3)
@@ -884,9 +1125,8 @@ class SupervisorTests(unittest.TestCase):
 
     def test_cancel_between_requests_retains_completed_download(self):
         with mock.patch.object(speed_test, "download_once", return_value=speed_test.Download(.2, 3)):
-            with mock.patch("builtins.print", side_effect=KeyboardInterrupt):
-                with self.assertRaises(speed_test.DownloadError) as caught:
-                    measure("http://localhost/")
+            with self.assertRaises(speed_test.DownloadError) as caught:
+                measure("http://localhost/", progress=mock.Mock(side_effect=KeyboardInterrupt))
         self.assertEqual(caught.exception.reason, "cancelled")
         self.assertIsNone(caught.exception.partial)
         self.assertEqual(len(caught.exception.downloads), 1)
