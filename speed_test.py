@@ -23,6 +23,8 @@ from urllib.request import HTTPErrorProcessor, HTTPHandler, HTTPSHandler, Reques
 
 REQUEST_COUNT = 10
 CHUNK_SIZE = 64 * 1024
+PROGRESS_BYTES = 1024 * 1024
+PROGRESS_INTERVAL = 0.1
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_DOWNLOAD_TIMEOUT = 120.0
 CLEANUP_TIMEOUT = 0.5
@@ -243,6 +245,8 @@ def _download_worker(
 ) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     count = 0
+    last_progress_count = 0
+    last_progress_at = 0.0
     started = perf_counter()
     try:
         opener = build_opener(_HTTPHandler(), _HTTPSHandler(), _ResponseProcessor())
@@ -279,7 +283,14 @@ def _download_worker(
                     if not data:
                         break
                     count += len(data)
-                    sender.send(_Progress(count))
+                    now = perf_counter()
+                    # Preserve the first payload even if the next read stalls.
+                    if (last_progress_count == 0
+                            or count - last_progress_count >= PROGRESS_BYTES
+                            or now - last_progress_at >= PROGRESS_INTERVAL):
+                        sender.send(_Progress(count))
+                        last_progress_count = count
+                        last_progress_at = now
                 result = Download(perf_counter() - started, count)
             sender.send(_Complete(result))
             return

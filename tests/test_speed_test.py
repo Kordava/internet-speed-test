@@ -356,6 +356,69 @@ class CLIHarness(unittest.TestCase):
             self.assertIn("Completed-only speed:", out)
 
 class CLIReliabilityTests(CLIHarness):
+    def test_complete_progress_domain(self):
+        for tls, framing, size in itertools.product(
+            (False, True), ("fixed", "chunked", "eof"), (0, 3, 2097159),
+        ):
+            with self.subTest(tls=tls, framing=framing, size=size):
+                def scenario(sock, index, path, server):
+                    response(sock, *framed(framing, b"x" * size))
+                with RawServer(scenario, tls) as server:
+                    code, out, err, _ = self.cli(server, ["--count", "1"])
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(server.paths, ["/"])
+                    self.assert_complete(out)
+                    self.assert_total(out, size)
+                    if self.json_mode:
+                        report = json.loads(out)
+                        self.assertEqual(report["completed_count"], 1)
+                        item = report["downloads"][0]
+                        self.assertEqual(item["bytes_downloaded"], size)
+                        self.assertGreater(item["elapsed_seconds"], 0)
+                        if size == 0:
+                            self.assertEqual(report["statistics"]["speed_mbps"], 0)
+                    else:
+                        self.assertRegex(err, rf"Request 01/1: .* {size:,} bytes")
+
+    def test_forced_stop_progress_domain(self):
+        for tls, framing, reason, profile in itertools.product(
+            (False, True), ("fixed", "chunked", "eof"),
+            ("download_timeout", "time_limit", "cancelled"), ("tiny", "burst", "slow"),
+        ):
+            if reason == "cancelled" and os.name != "posix":
+                continue
+            with self.subTest(tls=tls, framing=framing, reason=reason, profile=profile):
+                def scenario(sock, index, path, server):
+                    headers = {"fixed": b"Content-Length: 10000000\r\n",
+                               "chunked": b"Transfer-Encoding: chunked\r\n", "eof": b""}[framing]
+                    response(sock, headers, b"")
+                    def send(body):
+                        sock.sendall((f"{len(body):x}\r\n".encode() + body + b"\r\n")
+                                     if framing == "chunked" else body)
+                    send(b"abc")
+                    if profile == "burst":
+                        time.sleep(.03)
+                        send(b"x" * 196608)
+                    elif profile == "slow":
+                        for _ in range(3):
+                            time.sleep(.12)
+                            send(b"abc")
+                    server.ready.set()
+                    server.stop.wait(4)
+                with RawServer(scenario, tls) as server:
+                    args = ["--count", "1", "--timeout", "3",
+                            "--download-timeout", ".9" if reason == "download_timeout" else "3"]
+                    if reason == "time_limit":
+                        args += ["--max-time", "1.1"]
+                    result = self.cli(server, args, cancel=reason == "cancelled")
+                    self.assert_stopped(result, reason, 0, partial=9 if profile == "slow" else 3,
+                                        forced=True, count=1)
+                    sent = {"tiny": 3, "burst": 196611, "slow": 12}[profile]
+                    match = re.search(r"Partial request 1: at least ([\d,]+) bytes", result[2])
+                    self.assertLessEqual(int(match[1].replace(",", "")), sent)
+                    self.assertLess(result[3], 5)
+                    self.assertEqual(server.paths, ["/"])
+
     def test_complete_http_https_domain(self):
         for tls, framing, body in itertools.product((False, True), ("fixed", "chunked", "eof"), (b"", b"abc")):
             with self.subTest(tls=tls, framing=framing, body=body):
@@ -906,6 +969,77 @@ class ReportingTests(CLIHarness):
                     else:
                         self.assertIn("Series incomplete: worker_error", out)
                         self.assertIn("Completed-only speed: N/A", out)
+
+
+class ProgressWorkerTests(unittest.TestCase):
+    def run_worker(self, sizes, times, *, error=None, cap=None):
+        reply = mock.MagicMock(spec=speed_test._StrictResponse, status=200, chunked=True)
+        reads = iter([*(b"x" * size for size in sizes), error if error else b""])
+        sender = mock.Mock(spec=speed_test.Connection)
+        read_count = 0
+        def read(n):
+            nonlocal read_count
+            if read_count and sizes:
+                self.assertEqual(sender.send.call_args_list[0].args[0].bytes_downloaded, sizes[0])
+            read_count += 1
+            data = next(reads)
+            if isinstance(data, Exception):
+                raise data
+            if data:
+                self.assertLessEqual(len(data), n)
+            return data
+        reply.read1.side_effect = read
+        reply.__enter__.return_value = reply
+        opener = mock.Mock()
+        opener.open.return_value = reply
+        with mock.patch.object(speed_test, "build_opener", return_value=opener), \
+                mock.patch.object(speed_test.signal, "signal"), \
+                mock.patch.object(speed_test, "perf_counter", side_effect=[0, 0, *times, 2]) as clock, \
+                mock.patch.object(speed_test, "_Progress", wraps=speed_test._Progress) as progress:
+            speed_test._download_worker(sender, "http://localhost/", 1, cap)
+        messages = [call.args[0] for call in sender.send.call_args_list]
+        counts = [msg.bytes_downloaded for msg in messages if isinstance(msg, speed_test._Progress)]
+        self.assertEqual(progress.call_count, len(counts))
+        self.assertEqual(clock.call_count, len(sizes) + 3)
+        sender.close.assert_called_once()
+        return counts, messages[-1]
+
+    def test_progress_byte_and_time_boundaries(self):
+        cases = [
+            ([], [], []),
+            ([3, 4], [0, .099], [3]),
+            ([3, 4], [0, .1], [3, 7]),
+            ([3, 4], [0, .101], [3, 7]),
+            ([1, 1, 1, 1], [0, .11, .15, .22], [1, 2, 4]),
+            ([1] + [65536] * 15 + [65535], [0] * 17, [1]),
+            ([1] + [65536] * 16, [0] * 17, [1, 1048577]),
+            ([1] + [65536] * 15 + [65535, 2], [0] * 18, [1, 1048578]),
+            ([1] + [65536] * 16, [0] * 16 + [.1], [1, 1048577]),
+            ([3] + [65536] * 32 + [1], [0] * 34, [3, 1048579, 2097155]),
+        ]
+        for sizes, times, expected in cases:
+            with self.subTest(sizes=sizes, times=times):
+                counts, terminal = self.run_worker(sizes, times)
+                self.assertEqual(counts, expected)
+                self.assertEqual(terminal, speed_test._Complete(speed_test.Download(2, sum(sizes))))
+
+    def test_suppressed_progress_keeps_exact_terminal_results(self):
+        for error, reason in ((TimeoutError("idle"), "io_timeout"),
+                              (OSError("network"), "network_error"),
+                              (speed_test.http.client.IncompleteRead(b""), "incomplete_response"),
+                              (speed_test._ProtocolError("framing"), "protocol_error"),
+                              (RuntimeError("defect"), "worker_error")):
+            with self.subTest(reason=reason):
+                counts, terminal = self.run_worker([3, 4], [0, .01], error=error)
+                self.assertEqual(counts, [3])
+                self.assertIsInstance(terminal, speed_test._Failure)
+                self.assertEqual(terminal.reason, reason)
+                self.assertEqual(terminal.bytes_downloaded, 7)
+                self.assertTrue(terminal.exact_bytes)
+                self.assertEqual(terminal.elapsed_seconds, 2)
+        counts, terminal = self.run_worker([3, 4], [0, .01], cap=7)
+        self.assertEqual(counts, [3])
+        self.assertEqual(terminal, speed_test._Failure("byte_limit", "series byte budget exhausted", 7, 2))
 
 
 class ControlsUnitTests(unittest.TestCase):
