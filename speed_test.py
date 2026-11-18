@@ -15,6 +15,7 @@ import sys
 import threading
 from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
 from time import perf_counter
 from typing import Callable, Literal, TypedDict
 from urllib.error import HTTPError, URLError
@@ -240,6 +241,35 @@ class _Failure:
     exact_bytes: bool = True
 
 
+def _redirect_url(url: str, location: str | None, redirects: int) -> str:
+    """Resolve and validate a redirect without consuming its body."""
+    if not location or redirects == MAX_REDIRECTS:
+        raise _ProtocolError("missing Location or too many redirects (maximum 10)")
+    if any(ord(char) < 32 or ord(char) == 127 for char in location):
+        raise _ProtocolError("redirect URL contains control characters")
+    location = quote(location, encoding="iso-8859-1", safe=string.punctuation)
+    if urlsplit(location).scheme:
+        _validate_url(location)
+    return _validate_url(urljoin(url, location))
+
+
+def _failure_reason(exc: Exception) -> Reason:
+    """Classify worker errors, checking specific exceptions before their bases."""
+    if isinstance(exc, HTTPError):
+        return "http_error"
+    if isinstance(exc, http.client.IncompleteRead):
+        return "incomplete_response"
+    if isinstance(exc, (http.client.HTTPException, ValueError)):
+        return "protocol_error"
+    if isinstance(exc, TimeoutError) or (
+        isinstance(exc, URLError) and isinstance(exc.reason, TimeoutError)
+    ):
+        return "io_timeout"
+    if isinstance(exc, (URLError, OSError)):
+        return "network_error"
+    return "worker_error"
+
+
 def _download_worker(
     sender: Connection, url: str, timeout: float, max_bytes: int | None = None,
 ) -> None:
@@ -257,15 +287,7 @@ def _download_worker(
             })
             with opener.open(request, timeout=timeout) as response:
                 if response.status in (301, 302, 303, 307, 308):
-                    location = response.headers.get("Location")
-                    if not location or redirects == MAX_REDIRECTS:
-                        raise _ProtocolError("missing Location or too many redirects (maximum 10)")
-                    if any(ord(char) < 32 or ord(char) == 127 for char in location):
-                        raise _ProtocolError("redirect URL contains control characters")
-                    location = quote(location, encoding="iso-8859-1", safe=string.punctuation)
-                    if urlsplit(location).scheme:
-                        _validate_url(location)
-                    url = _validate_url(urljoin(url, location))
+                    url = _redirect_url(url, response.headers.get("Location"), redirects)
                     continue
                 if not 200 <= response.status < 300:
                     raise HTTPError(url, response.status, response.reason, response.headers, None)
@@ -276,10 +298,15 @@ def _download_worker(
                         # Chunked/EOF would require another read, violating the cap.
                         if not response.chunked and response.length == 0:
                             break
-                        sender.send(_Failure("byte_limit", "series byte budget exhausted", count,
-                                             perf_counter() - started))
+                        sender.send(_Failure(
+                            reason="byte_limit",
+                            detail="series byte budget exhausted",
+                            bytes_downloaded=count,
+                            elapsed_seconds=perf_counter() - started,
+                        ))
                         return
-                    data = response.read1(CHUNK_SIZE if remaining is None else min(CHUNK_SIZE, remaining))
+                    read_size = CHUNK_SIZE if remaining is None else min(CHUNK_SIZE, remaining)
+                    data = response.read1(read_size)
                     if not data:
                         break
                     count += len(data)
@@ -296,26 +323,20 @@ def _download_worker(
             return
     except Exception as exc:
         # This is the worker boundary. Unexpected defects remain worker_error.
-        if isinstance(exc, HTTPError):
-            reason = "http_error"
-        elif isinstance(exc, http.client.IncompleteRead):
-            reason = "incomplete_response"
-        elif isinstance(exc, (http.client.HTTPException, ValueError)):
-            reason = "protocol_error"
-        elif isinstance(exc, TimeoutError) or (
-            isinstance(exc, URLError) and isinstance(exc.reason, TimeoutError)
-        ):
-            reason = "io_timeout"
-        elif isinstance(exc, (URLError, OSError)):
-            reason = "network_error"
-        else:
-            reason = "worker_error"
-        sender.send(_Failure(reason, str(exc), count, perf_counter() - started))
+        reason = _failure_reason(exc)
+        sender.send(_Failure(
+            reason=reason,
+            detail=str(exc),
+            bytes_downloaded=count,
+            elapsed_seconds=perf_counter() - started,
+        ))
     finally:
         sender.close()
 
 
-def _receive(receiver: Connection, messages: queue.Queue) -> None:
+def _receive(
+    receiver: Connection, messages: queue.Queue[_Progress | _Complete | _Failure],
+) -> None:
     """Only this thread may block on a (possibly partial) IPC frame."""
     count = 0
     try:
@@ -327,7 +348,13 @@ def _receive(receiver: Connection, messages: queue.Queue) -> None:
                 if isinstance(message, _Progress):
                     count = message.bytes_downloaded
             except Exception as exc:
-                message = _Failure("worker_error", f"worker channel closed: {exc}", count, 0, False)
+                message = _Failure(
+                    reason="worker_error",
+                    detail=f"worker channel closed: {exc}",
+                    bytes_downloaded=count,
+                    elapsed_seconds=0,
+                    exact_bytes=False,
+                )
             # One producer, one consumer. Replace a queued progress value, never
             # a terminal message: the producer exits immediately after terminal.
             try:
@@ -344,7 +371,10 @@ def _receive(receiver: Connection, messages: queue.Queue) -> None:
         receiver.close()
 
 
-def _cleanup(worker, sender, receiver, reader, completed: bool) -> bool:
+def _cleanup(
+    worker: BaseProcess | None, sender: Connection | None,
+    receiver: Connection | None, reader: threading.Thread | None, completed: bool,
+) -> bool:
     """Bounded teardown; a second Ctrl+C must not abandon a live worker."""
     in_main = threading.current_thread() is threading.main_thread()
     previous = signal.signal(signal.SIGINT, signal.SIG_IGN) if in_main else None
@@ -389,11 +419,14 @@ def download_once(
         deadline_reason = "time_limit"
     if series_deadline is not None and started >= series_deadline:
         raise DownloadError(None, reason="time_limit", detail="series deadline exceeded")
-    receiver = sender = worker = reader = None
-    messages = queue.Queue(maxsize=1)
-    count = 0
-    result = None
-    failure = None
+    receiver: Connection | None = None
+    sender: Connection | None = None
+    worker: BaseProcess | None = None
+    reader: threading.Thread | None = None
+    messages: queue.Queue[_Progress | _Complete | _Failure] = queue.Queue(maxsize=1)
+    known_bytes = 0
+    result: Download | None = None
+    failure: _Failure | None = None
     try:
         context = multiprocessing.get_context("spawn")
         receiver, sender = context.Pipe(duplex=False)
@@ -405,16 +438,24 @@ def download_once(
         while True:
             remaining = deadline - perf_counter()
             if remaining <= 0:
-                failure = _Failure(deadline_reason, "download deadline exceeded" if deadline_reason == "download_timeout"
-                                   else "series deadline exceeded", count,
-                                   perf_counter() - started, False)
+                detail = (
+                    "download deadline exceeded" if deadline_reason == "download_timeout"
+                    else "series deadline exceeded"
+                )
+                failure = _Failure(
+                    reason=deadline_reason,
+                    detail=detail,
+                    bytes_downloaded=known_bytes,
+                    elapsed_seconds=perf_counter() - started,
+                    exact_bytes=False,
+                )
                 break
             try:
                 message = messages.get(timeout=min(remaining, 0.1))
             except queue.Empty:
                 continue
             if isinstance(message, _Progress):
-                count = message.bytes_downloaded
+                known_bytes = message.bytes_downloaded
                 continue
             if perf_counter() >= deadline:
                 continue  # A late terminal message cannot undo the deadline.
@@ -423,14 +464,28 @@ def download_once(
             else:
                 failure = message
                 if not failure.exact_bytes:
-                    failure = replace(failure, bytes_downloaded=max(count, failure.bytes_downloaded),
-                                      elapsed_seconds=perf_counter() - started)
+                    failure = replace(
+                        failure,
+                        bytes_downloaded=max(known_bytes, failure.bytes_downloaded),
+                        elapsed_seconds=perf_counter() - started,
+                    )
             break
     except KeyboardInterrupt:
-        failure = _Failure("cancelled", "interrupted by user", count,
-                           perf_counter() - started, False)
+        failure = _Failure(
+            reason="cancelled",
+            detail="interrupted by user",
+            bytes_downloaded=known_bytes,
+            elapsed_seconds=perf_counter() - started,
+            exact_bytes=False,
+        )
     except (OSError, ValueError, RuntimeError) as exc:
-        failure = _Failure("worker_error", str(exc), count, perf_counter() - started, False)
+        failure = _Failure(
+            reason="worker_error",
+            detail=str(exc),
+            bytes_downloaded=known_bytes,
+            elapsed_seconds=perf_counter() - started,
+            exact_bytes=False,
+        )
     finally:
         if failure is not None and not failure.exact_bytes:
             try:
@@ -438,19 +493,30 @@ def download_once(
             except queue.Empty:
                 pending = None
             if isinstance(pending, _Progress):
-                failure = replace(failure, bytes_downloaded=max(
-                    failure.bytes_downloaded, pending.bytes_downloaded,
-                ))
-        clean = _cleanup(worker, sender, receiver, reader, result is not None)
-    if not clean:
-        count = max(count, result.bytes_downloaded if result is not None else 0,
-                    failure.bytes_downloaded if failure is not None else 0)
-        failure = _Failure("worker_error", "worker cleanup could not be confirmed", count,
-                           perf_counter() - started, False)
+                failure = replace(
+                    failure,
+                    bytes_downloaded=max(failure.bytes_downloaded, pending.bytes_downloaded),
+                )
+        cleanup_confirmed = _cleanup(worker, sender, receiver, reader, result is not None)
+    if not cleanup_confirmed:
+        completed_bytes = result.bytes_downloaded if result is not None else 0
+        failed_bytes = failure.bytes_downloaded if failure is not None else 0
+        known_bytes = max(known_bytes, completed_bytes, failed_bytes)
+        failure = _Failure(
+            reason="worker_error",
+            detail="worker cleanup could not be confirmed",
+            bytes_downloaded=known_bytes,
+            elapsed_seconds=perf_counter() - started,
+            exact_bytes=False,
+        )
     if failure is not None:
         raise DownloadError(PartialDownload(
-            1, failure.bytes_downloaded, failure.elapsed_seconds,
-            failure.reason, failure.exact_bytes, failure.detail,
+            number=1,
+            bytes_downloaded=failure.bytes_downloaded,
+            elapsed_seconds=failure.elapsed_seconds,
+            reason=failure.reason,
+            exact_bytes=failure.exact_bytes,
+            detail=failure.detail,
         ))
     return result
 
@@ -607,6 +673,14 @@ def _display(value: float | None, precision: int = 3, unit: str = "s") -> str:
     return "N/A" if value is None else f"{value:.{precision}f} {unit}"
 
 
+def _format_partial(partial: PartialPayload) -> str:
+    accuracy = "" if partial["exact_bytes"] else "at least "
+    return (
+        f"Partial request {partial['number']}: {accuracy}{partial['bytes_downloaded']:,} bytes, "
+        f"{partial['elapsed_seconds']:.3f} s"
+    )
+
+
 def render_text(report: Report) -> None:
     print(f"URL: {report['url']}\n")
     if report["status"] == "completed":
@@ -630,12 +704,10 @@ def render_text(report: Report) -> None:
     print(f"{label} {_display(stats['speed_mbps'], 2, 'Mbit/s')}")
     partial = report["partial"]
     if partial is not None:
-        accuracy = "" if partial["exact_bytes"] else "at least "
-        print(f"Partial request {partial['number']}: {accuracy}{partial['bytes_downloaded']:,} bytes, "
-              f"{partial['elapsed_seconds']:.3f} s")
+        print(_format_partial(partial))
 
 
-def main(argv: list[str] | None = None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Measure download speed using sequential HTTP(S) requests."
     )
@@ -656,6 +728,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="series HTTP body byte cap (default: unlimited); chunked/EOF responses "
                              "at the exact cap remain incomplete without a further read")
     parser.add_argument("--json", action="store_true", help="write one JSON report to stdout")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
     args = parser.parse_args(argv)
     try:
         _validate_url(args.url)
@@ -683,9 +760,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         partial = report["partial"]
         if partial is not None:
-            accuracy = "" if partial["exact_bytes"] else "at least "
-            print(f"Partial request {partial['number']}: {accuracy}{partial['bytes_downloaded']:,} bytes, "
-                  f"{partial['elapsed_seconds']:.3f} s", file=sys.stderr)
+            print(_format_partial(partial), file=sys.stderr)
     if report["warnings"]:
         print("Warning: average completed request time is below 1 s; the result depends more on "
               "latency and does not guarantee a bandwidth estimate.", file=sys.stderr)
