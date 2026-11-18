@@ -687,9 +687,14 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-if __name__ == "__main__":
+def cli() -> int:
+    """Shared command entry point, including terminal interruption handling."""
     try:
-        sys.exit(main())
+        return main()
     except KeyboardInterrupt:
         print("\nInterrupted", file=sys.stderr)
-        sys.exit(130)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(cli())

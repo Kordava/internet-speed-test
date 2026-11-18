@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=70.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "internet-speed-test"
+version = "0.1.0"
+description = "Measure download speed using sequential HTTP(S) requests"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+internet-speed-test = "speed_test:cli"
+
+[tool.setuptools]
+py-modules = ["speed_test"]
+packages = []

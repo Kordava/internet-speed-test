@@ -107,8 +107,8 @@ class SpeedTestTests(unittest.TestCase):
                 positive_seconds(value)
 
 
-ROOT = Path(__file__).resolve().parent
-FIXTURES = ROOT / "tests" / "fixtures"
+ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
 def framed(framing, body=b"abc"):
@@ -199,20 +199,24 @@ def process_alive(pid):
 
 class CLIHarness(unittest.TestCase):
     json_mode = False
+    command = (sys.executable, "-u", str(ROOT / "speed_test.py"))
+    cwd = None
 
     def cli(self, server, args=(), cancel=False, env_extra=None, trust=True):
         env = os.environ.copy()
         for key in list(env):
             if key.lower().endswith("_proxy") or key in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
                 env.pop(key)
+        env.pop("PYTHONPATH", None)
+        env.pop("PYTHONHOME", None)
         env.update(NO_PROXY="*", PYTHONDONTWRITEBYTECODE="1")
         if trust:
             env["SSL_CERT_FILE"] = str(FIXTURES / "ca.pem")
         env.update(env_extra or {})
         process = subprocess.Popen(
-            [sys.executable, "-u", str(ROOT / "speed_test.py"), server.url, *args,
+            [*self.command, server.url, *args,
              *(["--json"] if self.json_mode else [])],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, cwd=self.cwd,
             start_new_session=os.name == "posix",
         )
         pids = set()
